@@ -1,0 +1,8 @@
+setuptools
+opencv_python
+Cython
+matplotlib
+numpy
+Pillow
+scipy
+tqdm

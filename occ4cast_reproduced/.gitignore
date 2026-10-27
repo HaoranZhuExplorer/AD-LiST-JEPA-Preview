@@ -1,0 +1,13 @@
+stored_data
+wandb
+debug
+argoverse_data_samples/
+
+# Ignore Python cache files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Ignore singularity files
+*.ext3

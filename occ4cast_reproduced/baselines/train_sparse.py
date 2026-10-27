@@ -1,0 +1,331 @@
+# python train_sparse.py -d lyft       -m conv3d_sparse       -r /Occ4D-Lyft       --p_pre 5       --p_post 5       --batch-size 6       --num-workers 16       --num-epoch 15
+
+import os
+import re
+import json
+import argparse
+from tqdm import tqdm
+
+import torch
+import torchmetrics
+from torch.cuda.amp import autocast, GradScaler
+import numpy as np
+from torch.utils.data import DataLoader
+from torch.nn.utils import clip_grad_norm_
+
+from models import Conv2DForecasting, Conv3DForecasting, ConvLSTM, Conv3DSparseForecasting
+import wandb
+
+RESUME_LAST=0
+
+def make_data_loaders(args):
+    print("debug", args.dataset)
+    if args.dataset.lower() == "lyft":
+        from data.lyft_sparse import LyftDataset
+        print("debug dataloader", args.dataroot)
+        lyft_dataset = LyftDataset(args.dataroot, "train", args.p_pre, args.p_post)
+        print("debug lyft dataset", len(lyft_dataset))
+        train_loader = DataLoader(
+            LyftDataset(args.dataroot, "train", args.p_pre, args.p_post),
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=args.num_workers,
+            collate_fn = LyftDataset.collate_batch,
+        )
+        val_loader = DataLoader(
+            LyftDataset(args.dataroot, "valid", args.p_pre, args.p_post),
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=args.num_workers,
+            collate_fn = LyftDataset.collate_batch,
+        )
+        
+    elif args.dataset.lower() == "argoverse":
+        from data.argoverse import ArgoverseDataset
+
+        train_loader = DataLoader(
+            ArgoverseDataset(args.dataroot, "train", args.p_pre, args.p_post),
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=args.num_workers,
+        )
+        val_loader = DataLoader(
+            ArgoverseDataset(args.dataroot, "valid", args.p_pre, args.p_post),
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=args.num_workers,
+        )
+    elif args.dataset.lower() == "apolloscape":
+        from data.apolloscape import ApolloScapeDataset
+
+        train_loader = DataLoader(
+            ApolloScapeDataset(args.dataroot, "train", args.p_pre, args.p_post),
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=args.num_workers,
+        )
+        val_loader = DataLoader(
+            ApolloScapeDataset(args.dataroot, "valid", args.p_pre, args.p_post),
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=args.num_workers,
+        )
+    else:
+        raise NotImplementedError(f"Dataset {args.dataset} is not supported.")
+    
+    voxel_size = train_loader.dataset.get_voxel_size()
+    class_fc = val_loader.dataset.get_class_fc()
+
+    return train_loader, val_loader, voxel_size, class_fc
+
+
+def mkdir_if_not_exists(d):
+    if not os.path.exists(d):
+        print(f"creating directory {d}")
+        os.makedirs(d, exist_ok=True)
+
+
+def resume_from_ckpts(ckpt_dir, model, optimizer, scheduler, scaler=None, amp=False):
+    if len(os.listdir(ckpt_dir)) > 0:
+        
+        if RESUME_LAST:
+            ckpt_path = f"{ckpt_dir}/last.pth"
+        else:
+            pattern = re.compile(r"model_epoch_(\d+).pth")
+            epochs = []
+            for f in os.listdir(ckpt_dir):
+                m = pattern.findall(f)
+                if len(m) > 0:
+                    epochs.append(int(m[0]))
+            resume_epoch = max(epochs)
+            ckpt_path = f"{ckpt_dir}/model_epoch_{resume_epoch}.pth"
+
+        print(f"Resume training from checkpoint {ckpt_path}")
+
+        checkpoint = torch.load(ckpt_path)
+        model.load_state_dict(checkpoint["model_state_dict"])
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+        if amp:
+            scaler.load_state_dict(checkpoint["scaler_state_dict"])
+
+        start_epoch = 1 + checkpoint["epoch"]
+        n_iter = checkpoint["n_iter"]
+    else:
+        start_epoch = 0
+        n_iter = 0
+    return start_epoch, n_iter
+
+
+def load_data_to_gpu(batch_dict):
+    for key, val in batch_dict.items():
+        if key == 'labels' or key=='invalid':
+            batch_dict[key] = val.cuda()
+        elif not isinstance(val, np.ndarray):
+                continue
+        else:
+            batch_dict[key] = torch.from_numpy(val).float().cuda()
+
+def train(args):
+    # wandb
+    # Initialize wandb
+    wandb.init(project='<your_wandb_project>', entity='<your_wandb_entity>', name=args.extra_tag) # to do: update name with args
+
+    # device
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+    # dataset
+    train_loader, val_loader, voxel_size, class_fc = make_data_loaders(args)
+
+    # model
+    if args.model.lower() == "occ":
+        model = Conv2DForecasting(args.p_pre+1, args.p_post+1, voxel_size[-2])
+    elif args.model.lower() == "convlstm":
+        model = ConvLSTM(args.p_pre+1, args.p_post+1, voxel_size[-2])
+    elif args.model.lower() == "conv3d":
+        model = Conv3DForecasting(args.p_pre+1, args.p_post+1)
+    elif args.model.lower() == "conv3d_sparse":
+        model = Conv3DSparseForecasting(args.p_pre+1, args.p_post+1)
+    elif args.model.lower() == "conv3d_softiou":
+        model = Conv3DForecasting(args.p_pre+1, args.p_post+1, use_soft_iou=True)
+    else:
+        raise NotImplementedError(f"Model {args.model} is not supported.")
+    
+    model = model.to(device)
+
+    # optimizer
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr_start)
+
+    # scheduler
+    scheduler = torch.optim.lr_scheduler.StepLR(
+        optimizer, step_size=args.lr_epoch, gamma=args.lr_decay
+    )
+
+    # Scaler
+    if args.amp:
+        scaler = GradScaler()
+    else:
+        scaler = None
+
+    # dump config
+    save_dir = f"results/{args.model}_{args.dataset}_p{args.p_pre}{args.p_post}_lr{args.lr_start}_batch{args.batch_size}{'_amp' if args.amp else ''}_{args.extra_tag}"
+    mkdir_if_not_exists(save_dir)
+    with open(f"{save_dir}/config.json", "w") as f:
+        json.dump(args.__dict__, f, indent=4)
+    print(json.dumps(args.__dict__, indent=4))
+
+    # resume
+    ckpt_dir = f"{save_dir}/ckpts"
+    mkdir_if_not_exists(ckpt_dir)
+    start_epoch, n_iter = resume_from_ckpts(ckpt_dir, model, optimizer, scheduler, scaler, args.amp)
+
+    # train
+    best_metric = 0
+    for epoch in range(start_epoch, args.num_epoch):
+        model.train()
+        train_loss = 0
+        num_batch = len(train_loader)
+
+        for batch in (pbar := tqdm(train_loader)):
+            load_data_to_gpu(batch)
+
+            optimizer.zero_grad()
+            with autocast(enabled=args.amp):
+                loss = model(batch)
+            if args.amp:
+                scaler.scale(loss).backward()
+                total_grad_norm = clip_grad_norm_(model.parameters(), max_norm=100)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                total_grad_norm = clip_grad_norm_(model.parameters(), max_norm=100)
+                optimizer.step()
+
+            batch_loss = loss.item()
+            train_loss += batch_loss
+            pbar.set_description(f"train loss {batch_loss:.6f}")
+
+            # ---- W&B logging: per-iteration training stats ----
+            n_iter += 1
+            wandb.log({
+                "train/loss": batch_loss,
+                "train/lr": optimizer.param_groups[0]["lr"],
+                "grad_norm": total_grad_norm,
+                "train/epoch": epoch,
+            }, step=n_iter)
+
+            print("debug batch_loss", batch_loss, f"grad_norm {total_grad_norm.item():.6f}")
+        
+        print(f"Epoch {epoch} train loss {train_loss / num_batch:.6f}")
+
+        num_batch = len(val_loader)
+        val_metric = {"precision": 0, "recall": 0, "f1": 0, "iou": 0, "ap": 0}
+        with torch.no_grad():
+            model.eval()
+            for batch in tqdm(val_loader):
+                load_data_to_gpu(batch)
+                batch['labels'][batch['labels']>0] = 1
+
+                output = model(batch)
+                output = torch.sigmoid(output)
+
+                valid_mask = ~batch['invalid']
+                output = output[valid_mask]
+                batch['labels'] = batch['labels'][valid_mask]
+                
+                precision = torchmetrics.functional.classification.binary_precision(output, batch['labels'])
+                recall = torchmetrics.functional.classification.binary_recall(output, batch['labels'])
+                f1 = 2 * precision * recall / (precision + recall)
+                iou = torchmetrics.functional.classification.binary_jaccard_index(output, batch['labels'])
+                ap = torchmetrics.functional.classification.binary_average_precision(output, batch['labels'])
+
+                val_metric["precision"] += precision.item()
+                val_metric["recall"] += recall.item()
+                val_metric["f1"] += f1.item()
+                val_metric["iou"] += iou.item()
+                val_metric["ap"] += ap.item()
+            
+        for key in val_metric:
+            val_metric[key] /= num_batch
+        print(f"Epoch {epoch} val")
+        print(json.dumps(val_metric, indent=4))
+
+        # ---- W&B logging: epoch-level validation metrics (averaged) ----
+        wandb.log({
+            "val/precision": val_metric["precision"],
+            "val/recall": val_metric["recall"],
+            "val/f1": val_metric["f1"],
+            "val/iou": val_metric["iou"],
+            "val/ap": val_metric["ap"],
+            "val/epoch": epoch
+        }, step=n_iter)
+
+        if val_metric["iou"] > best_metric:
+            best_metric = val_metric["iou"]
+            ckpt_path = f"{ckpt_dir}/model_epoch_{epoch}.pth"
+            save_dict = {
+                "epoch": epoch,
+                "n_iter": n_iter,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(),
+            }
+            if args.amp:
+                save_dict["scaler_state_dict"] = scaler.state_dict()
+            torch.save(
+                save_dict,
+                ckpt_path,
+            )
+            print(f"Save model to {ckpt_path}")
+
+        # save last model
+        last_path = f"{ckpt_dir}/last.pth"
+        save_last_dict = {
+            "epoch": epoch,
+            "n_iter": n_iter,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict(),
+        }
+        if args.amp:
+            save_last_dict["scaler_state_dict"] = scaler.state_dict()
+        torch.save(
+            save_last_dict,
+            last_path,
+        )
+        print(f"Last model saved to {last_path}")
+        scheduler.step()
+        
+    wandb.finish()
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+
+    data_group = parser.add_argument_group("data")
+    data_group.add_argument('-d', "--dataset", type=str, default="argoverse")
+    data_group.add_argument('-r', "--dataroot", type=str, default="<your_path>/lyft_kitti")
+    data_group.add_argument("--p_pre", type=int, default=10)
+    data_group.add_argument("--p_post", type=int, default=10)
+
+    model_group = parser.add_argument_group("model")
+    model_group.add_argument('-m', "--model", type=str, default="occ")
+    model_group.add_argument("--optimizer", type=str, default="Adam")  # Adam with 5e-4
+    model_group.add_argument("--lr-start", type=float, default=5e-4)
+    model_group.add_argument("--lr-epoch", type=int, default=5)
+    model_group.add_argument("--lr-decay", type=float, default=0.1)
+    model_group.add_argument("--num-epoch", type=int, default=15)
+    model_group.add_argument("--batch-size", type=int, default=16)
+    model_group.add_argument("--num-workers", type=int, default=4)
+    model_group.add_argument("--amp", action="store_true")
+    model_group.add_argument("--extra_tag", type=str, default='default', help='extra tag for this experiment')
+
+    args = parser.parse_args()
+
+    # Reproducibility
+    np.random.seed(0)
+    torch.manual_seed(0)
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+
+    train(args)

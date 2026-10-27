@@ -1,0 +1,17 @@
+labels: 
+  0 : "FREE"
+  1 : "VEHICLE"
+  2 : "PEDESTRIAN"
+  3 : "CYCLIST"
+
+label_fc:
+  0 : 0
+  1 : 0
+  2 : 0
+  3 : 0
+
+learning_ignore: # Ignore classes
+  0: True
+  1: False
+  2: False
+  3: False
